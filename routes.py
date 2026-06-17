@@ -9,7 +9,7 @@ from functools import wraps
 from datetime import datetime, timedelta
 from sqlalchemy import func, desc
 
-from models import db, User, Member, Product, Category, Order, OrderItem, Inventory, ReturnExchange, ReturnReason
+from models import db, User, Member, Product, Category, Order, OrderItem, InventoryLog, ReturnExchange, ReturnReason
 
 # ==================== 认证蓝图 ====================
 auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
@@ -92,8 +92,7 @@ def list_members():
     if search:
         query = query.filter(
             (Member.name.ilike(f'%{search}%')) |
-            (Member.phone.ilike(f'%{search}%')) |
-            (Member.member_no.ilike(f'%{search}%'))
+            (Member.phone.ilike(f'%{search}%'))
         )
     
     if status:
@@ -169,7 +168,7 @@ def list_products():
     if search:
         query = query.filter(
             (Product.name.ilike(f'%{search}%')) |
-            (Product.sku.ilike(f'%{search}%'))
+            (Product.code.ilike(f'%{search}%'))
         )
     
     if category:
@@ -187,11 +186,12 @@ def create_product():
     if request.method == 'POST':
         product = Product()
         product.name = request.form.get('name')
-        product.sku = request.form.get('sku')
+        product.code = request.form.get('code')
         product.category_id = request.form.get('category_id')
-        product.unit_price = float(request.form.get('unit_price', 0))
+        product.price = float(request.form.get('price', 0))
+        product.cost = float(request.form.get('cost', 0))
         product.description = request.form.get('description')
-        product.status = 'active'
+        product.is_active = True
         
         db.session.add(product)
         db.session.commit()
@@ -210,11 +210,12 @@ def edit_product(product_id):
     
     if request.method == 'POST':
         product.name = request.form.get('name')
-        product.sku = request.form.get('sku')
+        product.code = request.form.get('code')
         product.category_id = request.form.get('category_id')
-        product.unit_price = float(request.form.get('unit_price', 0))
+        product.price = float(request.form.get('price', 0))
+        product.cost = float(request.form.get('cost', 0))
         product.description = request.form.get('description')
-        product.status = request.form.get('status')
+        product.is_active = request.form.get('is_active') == 'on'
         
         db.session.commit()
         flash('产品信息已更新', 'success')
@@ -247,10 +248,7 @@ def list_sales():
     query = Order.query
     
     if search:
-        query = query.filter(
-            (Order.order_no.ilike(f'%{search}%')) |
-            (Order.member_id == search if search.isdigit() else False)
-        )
+        query = query.filter(Order.order_number.ilike(f'%{search}%'))
     
     if status:
         query = query.filter_by(status=status)
@@ -265,8 +263,9 @@ def create_order():
     """创建销售订单"""
     if request.method == 'POST':
         order = Order()
+        order.order_number = f"ORD-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         order.member_id = request.form.get('member_id') or None
-        order.created_by = current_user.id
+        order.cashier_id = current_user.id
         order.status = 'pending'
         order.created_at = datetime.now()
         
@@ -287,21 +286,26 @@ def create_order():
                     item.order_id = order.id
                     item.product_id = product_id
                     item.quantity = qty
-                    item.unit_price = product.unit_price
-                    item.subtotal = product.unit_price * qty
+                    item.unit_price = product.price
+                    item.subtotal = product.price * qty
                     
                     db.session.add(item)
                     total_amount += item.subtotal
+                    
+                    # 减少库存
+                    product.stock -= qty
         
+        order.subtotal = total_amount
         order.final_amount = total_amount
         order.status = 'completed'
+        order.payment_status = 'paid'
         db.session.commit()
         
-        flash(f'订单 {order.order_no} 创建成功', 'success')
+        flash(f'订单 {order.order_number} 创建成功', 'success')
         return redirect(url_for('sales.list_sales'))
     
     members = Member.query.filter_by(status='approved').all()
-    products = Product.query.filter_by(status='active').all()
+    products = Product.query.filter_by(is_active=True).all()
     
     return render_template('sales/create.html', members=members, products=products)
 
@@ -322,41 +326,63 @@ def list_inventory():
     page = request.args.get('page', 1, type=int)
     search = request.args.get('search', '')
     
-    query = Inventory.query
+    query = Product.query
     
     if search:
-        query = query.join(Product).filter(
+        query = query.filter(
             (Product.name.ilike(f'%{search}%')) |
-            (Product.sku.ilike(f'%{search}%'))
+            (Product.code.ilike(f'%{search}%'))
         )
     
-    inventories = query.paginate(page=page, per_page=20)
+    products = query.paginate(page=page, per_page=20)
     
-    return render_template('inventory/list.html', inventories=inventories, search=search)
+    return render_template('inventory/list.html', products=products, search=search)
 
-@inventory_bp.route('/<int:inventory_id>/adjust', methods=['GET', 'POST'])
+@inventory_bp.route('/<int:product_id>/adjust', methods=['GET', 'POST'])
 @login_required
-def adjust_inventory(inventory_id):
+def adjust_inventory(product_id):
     """调整库存"""
-    inventory = Inventory.query.get_or_404(inventory_id)
+    product = Product.query.get_or_404(product_id)
     
     if request.method == 'POST':
         adjustment_qty = int(request.form.get('adjustment_qty', 0))
-        reason = request.form.get('reason')
+        reason = request.form.get('reason', '')
+        operation_type = request.form.get('operation_type', 'adjust')
         
-        old_qty = inventory.quantity
-        inventory.quantity += adjustment_qty
+        old_qty = product.stock
+        product.stock += adjustment_qty
         
-        if inventory.quantity < 0:
+        if product.stock < 0:
             flash('库存不能为负数', 'danger')
             return redirect(url_for('inventory.list_inventory'))
         
+        # 创建库存日志
+        log = InventoryLog()
+        log.product_id = product_id
+        log.operation_type = operation_type
+        log.quantity = abs(adjustment_qty)
+        log.old_stock = old_qty
+        log.new_stock = product.stock
+        log.reason = reason
+        log.operator_id = current_user.id
+        log.created_at = datetime.now()
+        
+        db.session.add(log)
         db.session.commit()
         
-        flash(f'库存已调整: {old_qty} → {inventory.quantity}', 'success')
+        flash(f'库存已调整: {old_qty} → {product.stock}', 'success')
         return redirect(url_for('inventory.list_inventory'))
     
-    return render_template('inventory/adjust.html', inventory=inventory)
+    return render_template('inventory/adjust.html', product=product)
+
+@inventory_bp.route('/logs')
+@login_required
+def inventory_logs():
+    """库存日志"""
+    page = request.args.get('page', 1, type=int)
+    logs = InventoryLog.query.order_by(desc(InventoryLog.created_at)).paginate(page=page, per_page=20)
+    
+    return render_template('inventory/logs.html', logs=logs)
 
 # ==================== 退货蓝图 ====================
 return_bp = Blueprint('return', __name__, url_prefix='/return')
@@ -389,14 +415,14 @@ def create_return():
         notes = request.form.get('notes')
         
         return_item = ReturnExchange()
+        return_item.return_number = f"RET-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         return_item.order_id = order_id
         return_item.product_id = product_id
-        return_item.reason_id = reason_id
+        return_item.return_reason_id = reason_id
         return_item.quantity = quantity
         return_item.notes = notes
         return_item.status = 'pending'
-        return_item.created_at = datetime.now()
-        return_item.created_by = current_user.id
+        return_item.return_date = datetime.now()
         
         db.session.add(return_item)
         db.session.commit()
@@ -405,7 +431,7 @@ def create_return():
         return redirect(url_for('return.list_returns'))
     
     orders = Order.query.filter_by(status='completed').all()
-    reasons = ReturnReason.query.all()
+    reasons = ReturnReason.query.filter_by(is_active=True).all()
     
     return render_template('return/create.html', orders=orders, reasons=reasons)
 
@@ -416,13 +442,13 @@ def approve_return(return_id):
     return_item = ReturnExchange.query.get_or_404(return_id)
     
     return_item.status = 'approved'
-    return_item.approved_at = datetime.now()
-    return_item.approved_by = current_user.id
+    return_item.processed_date = datetime.now()
+    return_item.processed_by_id = current_user.id
     
-    # 调整库存
-    inventory = Inventory.query.filter_by(product_id=return_item.product_id).first()
-    if inventory:
-        inventory.quantity += return_item.quantity
+    # 恢复库存
+    product = Product.query.get(return_item.product_id)
+    if product:
+        product.stock += return_item.quantity
     
     db.session.commit()
     
@@ -436,8 +462,8 @@ def reject_return(return_id):
     return_item = ReturnExchange.query.get_or_404(return_id)
     
     return_item.status = 'rejected'
-    return_item.approved_at = datetime.now()
-    return_item.approved_by = current_user.id
+    return_item.processed_date = datetime.now()
+    return_item.processed_by_id = current_user.id
     
     db.session.commit()
     
@@ -481,15 +507,17 @@ def sales_report():
 @login_required
 def inventory_report():
     """库存报告"""
-    inventories = Inventory.query.all()
+    products = Product.query.all()
     
-    total_items = len(inventories)
-    low_stock = sum(1 for inv in inventories if inv.quantity < 10)
+    total_items = len(products)
+    low_stock = sum(1 for product in products if product.stock < product.minimum_stock)
+    total_value = sum(product.stock * product.cost for product in products if product.cost)
     
     return render_template('report/inventory.html',
-                         inventories=inventories,
+                         products=products,
                          total_items=total_items,
-                         low_stock=low_stock)
+                         low_stock=low_stock,
+                         total_value=total_value)
 
 @report_bp.route('/member')
 @login_required
@@ -498,7 +526,7 @@ def member_report():
     members = Member.query.filter_by(status='approved').all()
     
     total_members = len(members)
-    active_members = total_members  # 可根据需要定义"活跃"
+    active_members = total_members
     
     return render_template('report/member.html',
                          members=members,
