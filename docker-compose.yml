@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  supermarket-app:
+    build: .
+    container_name: supermarket-app
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - FLASK_APP=app.py
+    volumes:
+      - .:/app
+    command: python app.py
+    depends_on:
+      - mysql
+
+  mysql:
+    image: mysql:8.0
+    container_name: supermarket-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: supermarket_db
+      MYSQL_USER: supermarket
+      MYSQL_PASSWORD: supermarket123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+volumes:
+  mysql-data:
